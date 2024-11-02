@@ -1,0 +1,149 @@
+import requests
+import csv
+import time
+import os
+from typing import Dict, List, Any
+from dotenv import load_dotenv
+from tqdm import tqdm
+
+class GitHubRepoScraper:
+    def __init__(self, token: str = None):
+        if not token:
+            load_dotenv()  # Load environment variables from .env file
+            token = os.getenv('GITHUB_TOKEN')
+            if not token:
+                raise ValueError("GitHub token not found. Please set GITHUB_TOKEN environment variable or pass token to constructor.")
+
+        self.headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        self.base_url = 'https://api.github.com'
+        self.rate_limit_pause = 2  # Seconds to wait between API calls
+
+    def handle_rate_limiting(self, response: requests.Response) -> None:
+        """Handle GitHub API rate limiting."""
+        if 'X-RateLimit-Remaining' in response.headers:
+            remaining = int(response.headers['X-RateLimit-Remaining'])
+            if remaining < 10:
+                reset_time = int(response.headers['X-RateLimit-Reset'])
+                sleep_time = reset_time - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        time.sleep(self.rate_limit_pause)
+
+    def api_get(self, url: str, params: Dict = None) -> Dict:
+        """Make a GET request to GitHub API with error handling."""
+        try:
+            response = requests.get(
+                url,
+                headers=self.headers,
+                params=params
+            )
+            self.handle_rate_limiting(response)
+
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed: {e}")
+            return None
+
+    def get_user_repositories(self, username: str, max_repos: int = 500) -> List[Dict[str,Any]]:
+        """Fetch repositories for a specific user."""
+        repositories = []
+        page = 1
+
+        while len(repositories) < max_repos:
+            data = self.api_get(
+                f'{self.base_url}/users/{username}/repos',
+                params={
+                    'sort': 'pushed',
+                    'direction': 'desc',
+                    'page': page,
+                    'per_page': 100
+                }
+            )
+
+            if not data:
+                break
+
+            repositories.extend(data)
+            if len(data) < 100:
+                break
+
+            page += 1
+
+        return repositories[:max_repos]
+
+    def save_repositories_csv(self, repositories: List[Dict[str,Any]],
+                            filename: str = 'repositories.csv'):
+        """Save repository data to CSV file."""
+        fields = ['login', 'full_name', 'created_at', 'stargazers_count',
+                 'watchers_count', 'language', 'has_projects', 'has_wiki',
+                 'license_name']
+
+        os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+        print(f"Saving repository data to {filename}...")
+
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+
+            for repo in tqdm(repositories, desc="Writing repository data", unit="repo"):
+                row = {
+                    'login': repo['owner']['login'],
+                    'full_name': repo['full_name'],
+                    'created_at': repo['created_at'],
+                    'stargazers_count': repo['stargazers_count'],
+                    'watchers_count': repo['watchers_count'],
+                    'language': repo['language'] or '',
+                    'has_projects': str(repo['has_projects']).lower(),
+                    'has_wiki': str(repo['has_wiki']).lower(),
+                    'license_name': repo.get('license', {}).get('key', '')
+                }
+                writer.writerow(row)
+
+        print(f"Repository data saved successfully to {filename}")
+
+def read_usernames_from_csv(filename: str = 'users.csv') -> List[str]:
+    """Read usernames from the existing users CSV file."""
+    usernames = []
+    try:
+        with open(filename, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            usernames = [row['login'] for row in reader if row['login']]
+    except FileNotFoundError:
+        print(f"Error: {filename} not found. Please ensure the users CSV exists.")
+        exit(1)
+    except KeyError:
+        print("Error: 'login' column not found in the CSV file.")
+        exit(1)
+    
+    return usernames
+
+def main():
+    print("GitHub Repository Scraper from Existing Users")
+    print("---------------------------------------------")
+
+    # Read usernames from existing users.csv
+    usernames = read_usernames_from_csv()
+    print(f"Found {len(usernames)} users to process")
+
+    # Initialize scraper
+    scraper = GitHubRepoScraper()
+
+    # Fetch repositories for each user
+    print("\nFetching repositories for each user...")
+    all_repositories = []
+    for username in tqdm(usernames, desc="Collecting Repositories", unit="user"):
+        repos = scraper.get_user_repositories(username)
+        all_repositories.extend(repos)
+
+    # Save repository data
+    print("\nSaving collected repository data...")
+    scraper.save_repositories_csv(all_repositories, 'repositories.csv')
+
+    print("\nRepository data collection and processing complete!")
+
+if __name__ == "__main__":
+    main()
